@@ -115,9 +115,37 @@ class TrainResidualRL(TrainAgent):
 
     # ============================================================ phase 1: offline
 
-    def collect_offline_trajectories(self, n_success_target: int):
-        """Roll out the base policy (a_delta=0) until we have n_success_target
-        successful trajectories.
+    def collect_offline_trajectories(
+        self, n_success_target: int
+    ) -> list[dict[str, np.ndarray]]:
+        """
+        Phase 1: roll out the FROZEN base policy (residual = 0) on the shared
+        env pool and collect successful demonstration trajectories.
+
+        Steps every env in lockstep, keeping an episode only if it earned a
+        positive reward and ran for >= 2 steps; failed or 1-step episodes are
+        dropped. Stops once enough successes are banked.
+
+        Args:
+            n_success_target: how many successful trajectories to gather.
+
+        Returns:
+            A list of trajectories, one dict per successful episode. Its length
+            is >= n_success_target (it can overshoot, since multiple envs may
+            finish on the same step). Each dict holds these arrays, stacked over
+            that episode's T steps:
+
+                key      | shape               | dtype   | meaning
+                -------- | ------------------- | ------- | -------------------------
+                rgb      | (T, N_cam, H, W, 3) | uint8   | camera frames at step t
+                proprio  | (T, proprio_dim)    | float32 | robot state at step t
+                a_base   | (T, 7)              | float32 | normalized base action run
+                reward   | (T,)                | float32 | env reward at step t
+                done     | (T,)                | bool    | terminal flag, True only at t = T-1
+
+            T varies per episode. MC returns and the next_* (s') fields are NOT
+            included here; PLDReplayBuffer.load_offline_trajectories derives them
+            when these trajectories are ingested.
         """
         log.info(
             f"Collecting offline trajectories — target {n_success_target} successes, "

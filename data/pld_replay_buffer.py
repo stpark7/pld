@@ -63,6 +63,11 @@ class PLDReplayBuffer:
 
         # Offline buffer (filled once via load_offline_trajectories, never evicted)
         self._offline_initialised = False
+        self.offline_size = 0
+        self.offline_rgb = self.offline_proprio = self.offline_a_base = None
+        self.offline_a_delta = self.offline_a_total = self.offline_reward = None
+        self.offline_next_rgb = self.offline_next_proprio = self.offline_next_a_base = None
+        self.offline_done = self.offline_mc_return = None
 
         log.info(
             f"PLDReplayBuffer initialised | online_max={max_size}, n_cam={n_cam}, "
@@ -121,16 +126,36 @@ class PLDReplayBuffer:
             self.online_ptr += 1
             self.online_size = min(self.online_size + 1, self.max_size)
 
-    def load_offline_trajectories(self, trajectories):
-        """
+    def load_offline_trajectories(
+        self, trajectories: list[dict[str, np.ndarray]]
+    ) -> None:
+        """Ingest successful demonstration trajectories into the offline buffer
+        (one-shot; the offline buffer is filled once and never evicted).
+
+        For each episode it computes a per-step Monte-Carlo return (the Cal-QL
+        calibration floor) via a backward discounted sum that resets on done,
+        then flattens the episode into per-step transitions t -> t+1. The final
+        step (done=True) has no successor and is dropped, so a T-step episode
+        yields T-1 transitions.
+
         Args:
-            trajectories: list of dicts, each with keys
-                'rgb': (T, N_cam, H, W, 3) uint8
-                'proprio': (T, proprio_dim) float32
-                'a_base': (T, action_dim) float32       (action taken at step t)
-                'reward': (T,) float32
-                'done': (T,) bool                       (last step is True)
-            Note: a_delta = 0 for all offline steps (collected with base policy only).
+            trajectories: list of successful episodes, one dict per episode (the
+                output of collect_offline_trajectories). Each dict holds these
+                arrays, stacked over that episode's T steps:
+
+                    key      | shape               | dtype   | meaning
+                    -------- | ------------------- | ------- | -------------------------
+                    rgb      | (T, N_cam, H, W, 3) | uint8   | camera frames at step t
+                    proprio  | (T, proprio_dim)    | float32 | robot state at step t
+                    a_base   | (T, action_dim)     | float32 | normalized base action run
+                    reward   | (T,)                | float32 | env reward at step t
+                    done     | (T,)                | bool    | terminal flag, True only at t = T-1
+
+                T varies per episode and must be >= 2.
+
+        Returns:
+            None. Populates the offline_* storage tensors, sets offline_size to
+            the total transition count, and flips _offline_initialised to True.
         """
         offline_rgb = []
         offline_proprio = []
