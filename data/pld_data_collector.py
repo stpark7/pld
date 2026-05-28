@@ -15,9 +15,11 @@ Action plumbing:
        -> wrapper.step (which converts to 12-D dict, base_motion=0)
 
 Observation plumbing:
-  RobocasaImageWrapper already exposes a GR00T N1.5-ready obs dict (time axis
-  added, language included) via ``info["gr00t_raw"]``, so this collector feeds
-  it straight to GR00T without any further conversion.
+  RobocasaImageWrapper exposes the NON-image part of a GR00T N1.5 obs (5 state
+  keys + language + a ``_video_keys`` camera-order hint) via ``info["gr00t_raw"]``.
+  The camera frames are NOT duplicated there — they are the same pixels as
+  ``obs["rgb"]`` — so this collector reconstructs GR00T's per-camera video inputs
+  from ``obs["rgb"]`` (``_assemble_gr00t_obs``) before querying GR00T.
 
 Chunk-state save/restore:
   Because train and eval share ONE collector + 4-env pool, the orchestrator
@@ -83,6 +85,27 @@ class PLDDataCollector:
         self.chunk_idx = list(state["chunk_idx"])
         self.chunk_size = state["chunk_size"]
 
+    def _assemble_gr00t_obs(self, partial_obs: dict, rgb_env: np.ndarray) -> dict:
+        """Reconstruct the full GR00T observation for one env.
+
+        ``partial_obs`` is the video-less dict produced by RobocasaImageWrapper
+        (5 state keys + language + ``_video_keys``). ``rgb_env`` is that env's
+        ``obs["rgb"]`` of shape (N_cam, H, W, 3). The per-camera GR00T video
+        inputs are rebuilt here from the same pixels as ``obs["rgb"]`` (with the
+        ``T=1`` axis GR00T expects) so the image is never shipped twice.
+        """
+        video_keys = partial_obs["_video_keys"]
+        rgb_env = np.asarray(rgb_env)
+        if rgb_env.shape[0] != len(video_keys):
+            raise ValueError(
+                f"obs rgb has {rgb_env.shape[0]} cameras but gr00t_raw advertises "
+                f"{len(video_keys)} video keys {video_keys}"
+            )
+        out = {k: v for k, v in partial_obs.items() if k != "_video_keys"}
+        for i, vk in enumerate(video_keys):
+            out[vk] = rgb_env[i][None]  # (H, W, 3) -> (T=1, H, W, 3)
+        return out
+
     def _refill_chunk(self, env_idx: int, gr00t_obs: dict):
         chunk_dict = self.gr00t.get_action(gr00t_obs)
         arm_raw = self.normalizer.extract_arm_from_gr00t(chunk_dict)  # (T, 7)
@@ -98,18 +121,23 @@ class PLDDataCollector:
 
     # ---- main API ----
 
-    def get_a_base_norm(self, gr00t_obs_per_env: list) -> np.ndarray:
+    def get_a_base_norm(self, gr00t_obs_per_env: list, rgb: np.ndarray) -> np.ndarray:
         """
         Return a_base (normalized, 7-D) for the current obs of each env. Refills
         GR00T chunks for envs whose cache is exhausted.
 
         Args:
-            gr00t_obs_per_env: list of length n_envs with GR00T-ready obs dicts
-                (as produced by RobocasaImageWrapper into ``info["gr00t_raw"]``).
+            gr00t_obs_per_env: list of length n_envs with the video-less GR00T obs
+                dicts (5 state keys + language + ``_video_keys``) produced by
+                RobocasaImageWrapper into ``info["gr00t_raw"]``.
+            rgb: (n_envs, N_cam, H, W, 3) ``obs["rgb"]`` for the current step. Used
+                to rebuild GR00T's per-camera video inputs without a second image copy.
         """
+        rgb = np.asarray(rgb)
         for j in range(self.n_envs):
             if self.chunk_idx[j] >= self.chunk_size:
-                self._refill_chunk(j, gr00t_obs_per_env[j])
+                full_obs = self._assemble_gr00t_obs(gr00t_obs_per_env[j], rgb[j])
+                self._refill_chunk(j, full_obs)
 
         out = np.zeros((self.n_envs, 7), dtype=np.float32)
         for j in range(self.n_envs):
@@ -129,19 +157,27 @@ class PLDDataCollector:
     def get_next_a_base_norm(
         self,
         gr00t_obs_per_env_next: list,
+        next_rgb: np.ndarray,
         done: np.ndarray,
     ) -> np.ndarray:
         """
         Return a_base for the NEXT state (used as `next_a_base` in the buffer).
         Must be called AFTER `advance(done)`. For done envs, returns 0 (will be
         masked by (1 - done) in the Bellman target).
+
+        ``next_rgb`` is the (n_envs, N_cam, H, W, 3) next-step ``obs["rgb"]``, used
+        to rebuild GR00T's per-camera video inputs on a chunk refill.
         """
+        next_rgb = np.asarray(next_rgb)
         out = np.zeros((self.n_envs, 7), dtype=np.float32)
         for j in range(self.n_envs):
             if done[j]:
                 continue
             if self.chunk_idx[j] >= self.chunk_size:
-                self._refill_chunk(j, gr00t_obs_per_env_next[j])
+                full_obs = self._assemble_gr00t_obs(
+                    gr00t_obs_per_env_next[j], next_rgb[j]
+                )
+                self._refill_chunk(j, full_obs)
             raw = self.chunks[j][self.chunk_idx[j]]
             out[j] = self.normalizer.normalize(raw)
         return out

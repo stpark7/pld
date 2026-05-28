@@ -148,7 +148,7 @@ class TrainResidualRL(TrainAgent):
         last_gr00t_raw = gr00t_raw_list
 
         while len(successes) < n_success_target:
-            a_base_norm = self.collector.get_a_base_norm(last_gr00t_raw)  # (n_envs, 7)
+            a_base_norm = self.collector.get_a_base_norm(last_gr00t_raw, last_obs["rgb"])  # (n_envs, 7)
 
             a_total_norm = a_base_norm.copy()
             a_total_raw = self.collector.to_env_action(a_total_norm)
@@ -260,7 +260,7 @@ class TrainResidualRL(TrainAgent):
         """
         n_envs = self.n_envs
 
-        a_base_norm = self.collector.get_a_base_norm(last_gr00t_raw)  # (n_envs, 7)
+        a_base_norm = self.collector.get_a_base_norm(last_gr00t_raw, last_obs["rgb"])  # (n_envs, 7)
 
         # ---- chunk-consistency assertion ----
         if prev_next_a_base is not None and prev_done is not None:
@@ -290,7 +290,7 @@ class TrainResidualRL(TrainAgent):
 
         # Advance chunk pointers, then read next_a_base (0 for done envs).
         self.collector.advance(done)
-        next_a_base_norm = self.collector.get_next_a_base_norm(next_gr00t_raw, done)
+        next_a_base_norm = self.collector.get_next_a_base_norm(next_gr00t_raw, next_obs["rgb"], done)
 
         next_rgb = np.asarray(next_obs["rgb"])
         next_proprio = np.asarray(next_obs["state"], dtype=np.float32)
@@ -455,7 +455,7 @@ class TrainResidualRL(TrainAgent):
                     )
                     break
                 iter_count += 1
-                a_base_norm = collector.get_a_base_norm(last_gr00t_raw)
+                a_base_norm = collector.get_a_base_norm(last_gr00t_raw, last_obs["rgb"])
                 rgb_t = torch.as_tensor(last_obs["rgb"], device=self.device)
                 proprio_t = torch.as_tensor(
                     last_obs["state"], dtype=torch.float32, device=self.device
