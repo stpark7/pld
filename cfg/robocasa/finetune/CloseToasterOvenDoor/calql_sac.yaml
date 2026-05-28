@@ -1,0 +1,48 @@
+# Cal-QL + SAC residual-RL variant (full run). Inherits env/gr00t/normalization/
+# buffer/schedule defaults from _base_residual_rl and only adds the `algorithm:`
+# subtree (the plug point). Swapping algorithms = a new file like this one.
+defaults:
+  - _base_residual_rl
+  - _self_
+
+name: ${env_name}_calql_sac
+
+# The pluggable algorithm. The orchestrator only talks to the ResidualRLAlgorithm
+# contract, so all Cal-QL/SAC specifics live here.
+algorithm:
+  _target_: algo.calql_sac.PLDCalQLSAC
+  device: ${device}
+  action_dim: ${action_dim}
+  gamma: 0.99
+  polyak_tau: 0.005
+  cql_min_q_weight: 0.5
+  cql_n_actions: 5
+  cql_n_random: 5
+  use_calibration: true
+
+  encoder:
+    _target_: model.encoder.resnet18_encoder.ThreeCamResNet18Encoder
+    n_cam: 3
+    out_dim: 256
+    augment: true
+    freeze_bn: true
+    freeze_backbone: true
+    pretrained: true
+
+  actor:
+    _target_: model.actor.residual_gaussian_actor.ResidualGaussianActor
+    feat_dim: 256
+    proprio_dim: ${obs_dim}
+    action_dim: ${action_dim}
+    hidden_dim: 256
+    xi: ${pld.xi}
+
+  critic:
+    _target_: model.critic.critic.CriticObsAct
+    cond_dim: 265   # feat (256) + proprio (9)
+    mlp_dims: [256, 256, 256]
+    action_dim: ${action_dim}
+    action_steps: 1
+    activation_type: Mish
+    use_layernorm: true
+    double_q: true

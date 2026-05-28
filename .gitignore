@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+log_dir/
+data_dir/
+wandb/
+*.pt
+*.safetensors
+.claude/settings.local.json

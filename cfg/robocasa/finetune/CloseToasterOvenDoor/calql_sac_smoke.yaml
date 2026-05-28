@@ -1,0 +1,71 @@
+# Tiny Cal-QL + SAC config for end-to-end plumbing smoke tests.
+# Same structure as calql_sac.yaml but with minimal phase sizes so the full
+# 5-phase loop completes quickly on the shared 4-env pool.
+defaults:
+  - _base_residual_rl
+  - _self_
+
+name: ${env_name}_calql_sac_smoke
+
+# Disable wandb for smoke runs.
+wandb: null
+
+# Tiny schedule.
+pld:
+  xi: 0.5
+  offline_success_episodes: 3
+  critic_pretrain_steps: 200
+  warmup_episodes: 2
+  total_train_steps: 500
+  eval_every: 250
+  eval_episodes_during: 4
+  final_eval_episodes: 5
+  utd: 2
+
+train:
+  batch_size: 32
+  buffer_capacity: 2000
+  buffer_storage_device: cpu
+  lr: 3.0e-4
+  init_log_alpha: 0.0
+  target_entropy: -3.5
+  max_grad_norm: 1.0
+
+# Same pluggable algorithm as the full run (smaller cql sample counts).
+algorithm:
+  _target_: algo.calql_sac.PLDCalQLSAC
+  device: ${device}
+  action_dim: ${action_dim}
+  gamma: 0.99
+  polyak_tau: 0.005
+  cql_min_q_weight: 0.5
+  cql_n_actions: 4
+  cql_n_random: 4
+  use_calibration: true
+
+  encoder:
+    _target_: model.encoder.resnet18_encoder.ThreeCamResNet18Encoder
+    n_cam: 3
+    out_dim: 256
+    augment: true
+    freeze_bn: true
+    freeze_backbone: true
+    pretrained: true
+
+  actor:
+    _target_: model.actor.residual_gaussian_actor.ResidualGaussianActor
+    feat_dim: 256
+    proprio_dim: ${obs_dim}
+    action_dim: ${action_dim}
+    hidden_dim: 256
+    xi: ${pld.xi}
+
+  critic:
+    _target_: model.critic.critic.CriticObsAct
+    cond_dim: 265
+    mlp_dims: [256, 256, 256]
+    action_dim: ${action_dim}
+    action_steps: 1
+    activation_type: Mish
+    use_layernorm: true
+    double_q: true

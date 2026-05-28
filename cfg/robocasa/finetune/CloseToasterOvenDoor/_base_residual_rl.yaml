@@ -1,0 +1,91 @@
+# Shared base config for residual-RL variants on RoboCasa CloseToasterOvenDoor.
+# Variant configs (calql_sac.yaml, ...) pull these defaults and add an
+# `algorithm:` subtree. The orchestrator is algorithm-agnostic, so the only
+# variant-specific config lives under `algorithm:`.
+hydra:
+  run:
+    dir: ${logdir}
+  job:
+    chdir: false
+
+# Algorithm-agnostic 5-phase orchestrator (single shared 4-env pool, no eval pool).
+_target_: agent.train_residual_rl.TrainResidualRL
+
+name: ${env_name}_residual_rl
+logdir: ${oc.env:DICE_RL_LOG_DIR}/robocasa-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+task_description: "close the toaster oven door"
+
+seed: 42
+device: cuda:0
+env_name: CloseToasterOvenDoor
+run_eval: true
+obs_dim: 9          # proprio only — image handled separately by ResNet18 encoder
+action_dim: 7
+cond_steps: 1
+horizon_steps: 1
+act_steps: 1
+noise_dim: 7
+
+shape_meta:
+  obs:
+    state:
+      shape: [9]
+    rgb:
+      shape: [3, 256, 256, 3]   # (N_cam, H, W, 3) — keep_cams_separate output
+
+env:
+  env_type: robocasa
+  n_envs: 4                     # HARD CAP: single shared pool, NO separate eval pool
+  name: robocasa/${env_name}
+  best_reward_threshold_for_success: 1
+  max_episode_steps: 450
+  save_video: false
+  use_image_obs: true
+  render: false
+  wrappers:
+    robocasa_image:
+      normalization_path: null
+      shape_meta: ${shape_meta}
+      keep_cams_separate: true
+      success_steps_before_termination: 5
+      task_description: ${task_description}
+
+wandb:
+  entity: ${oc.env:DICE_RL_WANDB_ENTITY}
+  project: robocasa-${env_name}-residual-rl
+  run: ${now:%Y-%m-%d_%H-%M-%S_%f}_${name}
+
+# GR00T base policy (frozen)
+gr00t:
+  model_path: /home/lee/sangtae/robocasa_checkpoints/gr00t_n1-5/foundation_model_learning/target_posttraining/atomic_seen/checkpoint-60000
+  data_config: panda_omron
+  embodiment_tag: new_embodiment
+  denoising_steps: 4
+  action_chunk_size: 16
+  gr00t_repo_path: null  # set to your Isaac-GR00T checkout if not pip-installed
+
+# Action normalization (loaded from lerobot dataset's stats.json)
+normalization:
+  lerobot_meta_dir: /home/lee/sangtae/robocasa/datasets/v1.0/pretrain/atomic/CloseToasterOvenDoor/20250820/lerobot/meta
+  use_quantile: true   # q01/q99 for robust normalisation
+
+# PLD Stage-1 schedule (Table 5; RAM-bounded where noted)
+pld:
+  xi: 0.5
+  offline_success_episodes: 20         # paper uses 50; 20 to bound RAM
+  critic_pretrain_steps: 20000
+  warmup_episodes: 100
+  total_train_steps: 250000
+  eval_every: 10000
+  eval_episodes_during: 20
+  final_eval_episodes: 100
+  utd: 2
+
+train:
+  batch_size: 196
+  buffer_capacity: 10000   # RAM-bounded
+  buffer_storage_device: cpu
+  lr: 3.0e-4
+  init_log_alpha: 0.0
+  target_entropy: -3.5
+  max_grad_norm: 1.0
