@@ -120,3 +120,18 @@ OmegaConf resolvers `${eval:...}`, `${round_up:...}`, `${round_down:...}` are re
 
 `env/gym_utils/make_async` only supports `env_type == "robocasa"`; the other dice-rl sim backends
 (pusht, furniture, robomimic, d3il) and their wrappers were intentionally not ported and will raise.
+
+## Docstring format
+
+Non-trivial functions get a docstring in this shape (see
+`collect_offline_trajectories` / `pretrain_critic_step` for worked examples):
+
+1. **Summary** — one sentence on what it does. If it is a step in the 5-phase
+   loop, prefix with the phase (e.g. `Phase 3: ...`).
+2. **Body** — a short paragraph on *how* it works and the key invariant / *why*,
+   not a line-by-line restatement of the code.
+3. **Args:** — one line per argument: `name: meaning`.
+4. **Returns:** — describe the value. For structured returns use a table:
+   `key | shape | dtype | meaning` for stacked arrays, or `key | meaning` for a
+   scalar log dict. If it returns `None`, say so and name the side effect (what
+   state it mutates in place).

@@ -237,8 +237,26 @@ class TrainResidualRL(TrainAgent):
 
     # ============================================================ phase 2: critic pretrain
 
-    def pretrain_critic(self, n_steps: int):
-        """Critic-init via the algorithm contract (offline data only)."""
+    def pretrain_critic(self, n_steps: int) -> None:
+        """
+        Phase 2: initialize the Cal-QL critic on OFFLINE data only, before any
+        online interaction (gated by ``algorithm.needs_pretrain``).
+
+        Each step samples an offline-only minibatch (the successful base-policy
+        demos from phase 1, carrying their MC returns) and runs one
+        ``algorithm.pretrain_critic_step``, which does a Cal-QL critic + encoder
+        update and a polyak target sync. The actor is NOT touched here — this only
+        warms up Q so online RL doesn't start from a random critic. Progress (loss
+        + MC/calibration diagnostics) is logged, and optionally sent to wandb,
+        every 500 steps.
+
+        Args:
+            n_steps: number of offline critic-init gradient steps to run.
+
+        Returns:
+            None. Side effect only: the algorithm's encoder/critic/target-critic
+            weights are updated in place.
+        """
         log.info(f"Critic pretraining for {n_steps} steps (offline only)")
         for step in range(n_steps):
             batch = self.buffer.sample_offline_only(self.batch_size)
@@ -354,7 +372,26 @@ class TrainResidualRL(TrainAgent):
 
     # ============================================================ phase 3: warm-up
 
-    def warmup_collect(self, n_episodes: int):
+    def warmup_collect(self, n_episodes: int) -> None:
+        """
+        Phase 3: roll out the FROZEN base policy (residual = 0) to seed the
+        ONLINE buffer before online RL begins.
+
+        Bootstraps a fresh first observation on the shared env pool, then steps
+        every env in lockstep via ``_collect_and_add(use_residual=False)`` — each
+        step appends one online transition per env to the buffer — until
+        ``n_episodes`` episodes have finished. The chunk-consistency assertion
+        runs throughout (``prev_next_a_base`` / ``prev_done`` are threaded between
+        steps), so a desynced collector pointer fails fast here.
+
+        Args:
+            n_episodes: how many episodes to collect. The total can overshoot,
+                since multiple envs may finish on the same step.
+
+        Returns:
+            None. Side effect only: online transitions are appended to
+            ``self.buffer`` (the ring buffer); no trajectories are returned.
+        """
         log.info(f"Warm-up: collecting {n_episodes} episodes (a_delta=0)")
         last_obs, last_gr00t_raw = self._bootstrap_first_obs()
         completed = 0

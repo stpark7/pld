@@ -291,7 +291,39 @@ class PLDReplayBuffer:
             out = {k: v.to(self.sample_device, non_blocking=True) for k, v in out.items()}
         return out
 
-    def sample_offline_only(self, batch_size: int):
+    def sample_offline_only(self, batch_size: int) -> dict[str, torch.Tensor]:
+        """
+        Sample a minibatch drawn ENTIRELY from the offline buffer (no online mix).
+
+        Used by the critic-pretrain phase, where only the loaded demonstrations
+        exist and online experience hasn't been collected yet. Unlike ``sample``,
+        which mixes 50/50, this ignores the online ring buffer completely and
+        returns the calibrated offline MC returns (the Cal-QL floor). 
+
+        Args:
+            batch_size: number of offline transitions to draw.
+
+        Returns:
+            A batch dict on ``sample_device``, each value a tensor with leading
+            dim ``batch_size``:
+
+                key          | shape                  | meaning
+                ------------ | ---------------------- | --------------------------
+                rgb          | (B, N_cam, H, W, 3)    | camera frames at s (uint8)
+                proprio      | (B, proprio_dim)       | robot state at s
+                a_base       | (B, action_dim)        | normalized base action
+                a_delta      | (B, action_dim)        | residual action taken
+                a_total      | (B, action_dim)        | a_base + a_delta executed
+                reward       | (B,)                   | env reward
+                next_rgb     | (B, N_cam, H, W, 3)    | camera frames at s' (uint8)
+                next_proprio | (B, proprio_dim)       | robot state at s'
+                next_a_base  | (B, action_dim)        | base action at s'
+                done         | (B,)                   | terminal flag
+                mc_return    | (B,)                   | calibrated MC return (floor)
+
+        Raises:
+            RuntimeError: if the offline buffer is not initialised / is empty.
+        """
         if not self._offline_initialised or self.offline_size == 0:
             raise RuntimeError("Offline buffer not initialised")
         idx = torch.randint(0, self.offline_size, (batch_size,), device=self.storage_device)

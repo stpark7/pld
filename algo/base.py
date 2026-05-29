@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+import torch
 import torch.nn as nn
 
 
@@ -74,11 +75,24 @@ class ResidualRLAlgorithm(ABC, nn.Module):
     # ---------------- critic pretraining ----------------
 
     @abstractmethod
-    def pretrain_critic_step(self, offline_batch) -> dict:
-        """Run one critic-init update on an offline batch; return a log-info dict.
+    def pretrain_critic_step(self, offline_batch) -> dict[str, torch.Tensor]:
+        """Run ONE critic-init gradient step on an offline batch; return a log dict.
 
-        Variants that need no critic pretrain (``needs_pretrain == False``) may
-        leave this as a no-op (the orchestrator gates on ``needs_pretrain``).
+        Called repeatedly by ``TrainResidualRL.pretrain_critic`` during phase 2 to
+        warm up the critic on offline demonstrations only (no online data, no actor
+        update). Variants that need no critic pretrain (``needs_pretrain == False``)
+        may leave this as a no-op — the orchestrator gates the whole phase on
+        ``needs_pretrain``.
+
+        Args:
+            offline_batch: a minibatch dict sampled via
+                ``PLDReplayBuffer.sample_offline_only``, carrying the offline MC
+                returns used as the Cal-QL calibration floor.
+
+        Returns:
+            A dict of scalar tensors for logging (e.g. ``critic_loss``, ``td_loss``,
+            ``cql_loss``, ``q_data1_mean``, plus MC/calibration diagnostics). Keys
+            are algorithm-specific; the orchestrator only forwards them to the log.
         """
         raise NotImplementedError
 
