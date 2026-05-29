@@ -93,7 +93,16 @@ class PLDReplayBuffer:
         next_a_base,
         done,
     ):
-        """Add a batch of n_envs transitions to the online buffer."""
+        """Add a batch of n_envs transitions to the online buffer.
+
+        ``done`` here MUST be the TRUE terminal flag (task success / true env
+        termination), NOT ``terminated OR truncated``. Time-limit truncations are
+        not terminals: masking them as terminal in the critic ``(1 - done)``
+        backup would discard the bootstrap value of a still-viable state and bias
+        Q downward on every episode that hits ``max_episode_steps``. The trainer
+        is responsible for passing ``terminated`` (not the OR) here while keeping
+        the OR only for its own loop logic (advance / reset / counting).
+        """
         rgb_t = self._to_storage_tensor(rgb, torch.uint8)
         proprio_t = self._to_storage_tensor(proprio, torch.float32)
         a_base_t = self._to_storage_tensor(a_base, torch.float32)
@@ -260,6 +269,14 @@ class PLDReplayBuffer:
 
         # Concatenate
         out = {k: torch.cat([b[k] for b in batches], dim=0) for k in batches[0].keys()}
+
+        # Shuffle the combined offline+online batch. Offline and online samples
+        # are concatenated in order, so when the caller slices this into UTD
+        # minibatches (RLPD-style), a contiguous slice would be pure-offline or
+        # pure-online — breaking the 50/50-per-update mixing that RLPD/Cal-QL
+        # rely on. Permuting here keeps every slice ~50/50.
+        perm = torch.randperm(out["reward"].shape[0], device=self.storage_device)
+        out = {k: v[perm] for k, v in out.items()}
 
         # Move to sample_device
         if self.sample_device != self.storage_device:

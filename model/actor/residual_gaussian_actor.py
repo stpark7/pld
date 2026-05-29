@@ -44,6 +44,14 @@ class ResidualGaussianActor(nn.Module):
         self.mean_head = nn.Linear(hidden_dim, action_dim)
         self.logstd_head = nn.Linear(hidden_dim, action_dim)
 
+        # Residual RL: start at the base policy (residual ≈ 0). Zero the mean head
+        # so the initial — and the deterministic-eval — residual is exactly 0,
+        # instead of a random perturbation that degrades an already-strong base.
+        # Leave logstd at default init (std≈1) so the SAC entropy/temperature
+        # dynamics stay well-behaved.
+        nn.init.zeros_(self.mean_head.weight)
+        nn.init.zeros_(self.mean_head.bias)
+
         # log(xi) shift for log-prob (constant per-dim; doesn't affect gradients but
         # keeps the log-prob mathematically correct for the scaled action).
         self._log_xi = math.log(max(xi, 1e-8))
@@ -82,7 +90,10 @@ class ResidualGaussianActor(nn.Module):
             log_p = dist.log_prob(u).sum(-1)
             # tanh squash correction: d a_unscaled / d u = 1 - tanh(u)^2
             log_p = log_p - torch.log(1 - a_unscaled.pow(2) + 1e-6).sum(-1)
-            # constant shift for scaling by xi (per action dim)
-            log_p = log_p - self.action_dim * self._log_xi
+            # NOTE: deliberately NOT adding the xi-scaling constant
+            # (-action_dim*log(xi)). It is large for small xi (e.g. +16 at xi=0.1),
+            # inflates log_p, and makes the SAC temperature (alpha) blow up → the
+            # critic Q diverges. Tuning entropy on the unscaled tanh-Gaussian (in
+            # [-1,1]) keeps alpha stable for any xi.
             return a_delta, log_p
         return a_delta

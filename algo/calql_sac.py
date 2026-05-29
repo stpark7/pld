@@ -210,34 +210,28 @@ class PLDCalQLSAC(ResidualRLAlgorithm):
         cond = self._state_cond(feat, proprio)
         q_data1, q_data2 = self.critic(cond, a_total)
 
-        # TD target: sample N next actions, take max-Q
+        # TD target: standard SAC single-sample backup with clipped double-Q.
+        # NOTE: deliberately NOT the Cal-QL max-over-N (cql_max_target_backup)
+        # backup — that optimistic max-over-cql_n_actions target is meant to pair
+        # with a large critic ensemble we don't have, and it drove the critic Q to
+        # overestimate (q_data climbing to +50..+90 vs true return ~2-5). Sample
+        # exactly ONE next action from the actor at s' and take the clipped
+        # double-Q. (The conservative term below still uses cql_n_actions samples
+        # and the calibration floor — only the backup changed.)
         with torch.no_grad():
-            n_act = self.cql_n_actions
-            next_feat_rep = next_feat.repeat_interleave(n_act, dim=0)
-            next_proprio_rep = next_proprio.repeat_interleave(n_act, dim=0)
-            next_a_base_rep = next_a_base.repeat_interleave(n_act, dim=0)
-
-            next_a_delta_rep, next_logp_rep = self.actor(
-                next_feat_rep,
-                next_proprio_rep,
-                next_a_base_rep,
+            next_a_delta, next_logp = self.actor(
+                next_feat,
+                next_proprio,
+                next_a_base,
                 deterministic=False,
                 reparameterize=False,
                 get_logprob=True,
             )
-            next_a_total_rep = next_a_base_rep + next_a_delta_rep
+            next_a_total = next_a_base + next_a_delta
 
-            next_cond_rep = self._state_cond(next_feat_rep, next_proprio_rep)
-            next_q1_rep, next_q2_rep = self.target_critic(next_cond_rep, next_a_total_rep)
-            next_q_rep = torch.min(next_q1_rep, next_q2_rep)
-
-            next_q_rep = next_q_rep.view(B, n_act)
-            next_logp_rep = next_logp_rep.view(B, n_act)
-
-            max_idx = torch.argmax(next_q_rep, dim=1)
-            arange = torch.arange(B, device=next_q_rep.device)
-            next_q = next_q_rep[arange, max_idx]
-            next_logp = next_logp_rep[arange, max_idx]
+            next_cond = self._state_cond(next_feat, next_proprio)
+            next_q1, next_q2 = self.target_critic(next_cond, next_a_total)
+            next_q = torch.min(next_q1, next_q2)
 
             target_q = reward + gamma * (1.0 - done) * (next_q - alpha * next_logp)
 
@@ -245,55 +239,107 @@ class PLDCalQLSAC(ResidualRLAlgorithm):
             q_data2, target_q
         )
 
-        # ---- Conservative term ----
-        n_rand = self.cql_n_random
-        # Random actions uniform in [-1, 1]
+        # ---- Conservative term (faithful Cal-QL, ref JaxCQL/conservative_sac.py
+        # lines ~206-307). Conservative set = {random actions, current-state policy
+        # actions, next-state policy actions}, each importance-weighted by its log
+        # density (random -> log(0.5^A); policy groups -> their tanh-Gaussian log_pi).
+        # The Cal-QL calibration floor max(Q, mc_return) is applied to BOTH policy
+        # groups BEFORE the importance correction. ----
+        n_act = self.cql_n_actions  # policy-action samples per state (ref cql_n_actions)
+        n_rand = self.cql_n_random  # random-action samples per state
+
+        # --- Random actions uniform in [-1, 1]^A (ref: minval=-1, maxval=1) ---
         rand_actions = torch.rand(
             (B, n_rand, self.action_dim), device=feat.device
         ) * 2.0 - 1.0
-        log_rand = -self.action_dim * math.log(2.0)  # log(0.5) per dim — uniform on [-1,1]
+        # log density of uniform on [-1,1]^A = log(0.5^A) (ref random_density)
+        random_density = self.action_dim * math.log(0.5)
 
-        feat_rep = feat.repeat_interleave(n_rand, dim=0)
-        proprio_rep = proprio.repeat_interleave(n_rand, dim=0)
-        cond_rep = self._state_cond(feat_rep, proprio_rep)
+        feat_rep_r = feat.repeat_interleave(n_rand, dim=0)
+        proprio_rep_r = proprio.repeat_interleave(n_rand, dim=0)
+        cond_rep_r = self._state_cond(feat_rep_r, proprio_rep_r)
         rand_actions_flat = einops.rearrange(rand_actions, "B N A -> (B N) A")
-        q_rand_1, q_rand_2 = self.critic(cond_rep, rand_actions_flat)
-        q_rand_1 = q_rand_1.view(B, n_rand) - log_rand
-        q_rand_2 = q_rand_2.view(B, n_rand) - log_rand
+        q_rand_1, q_rand_2 = self.critic(cond_rep_r, rand_actions_flat)
+        q_rand_1 = q_rand_1.view(B, n_rand) - random_density
+        q_rand_2 = q_rand_2.view(B, n_rand) - random_density
 
-        # Policy actions on current state (a_total_pi) — no gradient through actor here
+        # --- Current-state policy actions (a_base + a_delta at s), N samples ---
+        # No gradient through the actor (matches the original / ref convention).
+        feat_rep_c = feat.repeat_interleave(n_act, dim=0)
+        proprio_rep_c = proprio.repeat_interleave(n_act, dim=0)
+        a_base_rep_c = batch["a_base"].repeat_interleave(n_act, dim=0)
         with torch.no_grad():
-            a_delta_pi, log_pi = self.actor(
-                feat, proprio, batch["a_base"],
+            a_delta_cur, log_pi_cur = self.actor(
+                feat_rep_c, proprio_rep_c, a_base_rep_c,
                 deterministic=False, reparameterize=False, get_logprob=True,
             )
-            a_total_pi = batch["a_base"] + a_delta_pi
-        q_pi_1, q_pi_2 = self.critic(cond, a_total_pi)
-        q_pi_1 = q_pi_1 - log_pi
-        q_pi_2 = q_pi_2 - log_pi
+            a_total_cur = a_base_rep_c + a_delta_cur
+        cond_rep_c = self._state_cond(feat_rep_c, proprio_rep_c)
+        q_cur_1, q_cur_2 = self.critic(cond_rep_c, a_total_cur)
+        q_cur_1 = q_cur_1.view(B, n_act)
+        q_cur_2 = q_cur_2.view(B, n_act)
+        log_pi_cur = log_pi_cur.view(B, n_act)
+
+        # --- Next-state policy actions (a_base' + a_delta' at s'), N samples ---
+        # next_feat is detached (computed under no_grad in the TD block); the critic
+        # Q here still carries gradient w.r.t. critic params (the conservative
+        # penalty pushes these OOD Q-values down). The BACKUP elsewhere uses the
+        # target critic + stop-grad; this conservative term uses the online critic
+        # at s', matching the ref (observations=next_observations, qf params).
+        feat_rep_n = next_feat.repeat_interleave(n_act, dim=0)
+        proprio_rep_n = next_proprio.repeat_interleave(n_act, dim=0)
+        a_base_rep_n = next_a_base.repeat_interleave(n_act, dim=0)
+        with torch.no_grad():
+            a_delta_nxt, log_pi_nxt = self.actor(
+                feat_rep_n, proprio_rep_n, a_base_rep_n,
+                deterministic=False, reparameterize=False, get_logprob=True,
+            )
+            a_total_nxt = a_base_rep_n + a_delta_nxt
+        cond_rep_n = self._state_cond(feat_rep_n, proprio_rep_n)
+        q_nxt_1, q_nxt_2 = self.critic(cond_rep_n, a_total_nxt)
+        q_nxt_1 = q_nxt_1.view(B, n_act)
+        q_nxt_2 = q_nxt_2.view(B, n_act)
+        log_pi_nxt = log_pi_nxt.view(B, n_act)
 
         # ---- Calibration diagnostics (known-risk fix #1) ----
-        # Before flooring, record how often / how much the MC-return floor binds.
+        # Before flooring, record how often / how much the MC-return floor binds
+        # across BOTH policy-action groups (ref logs bound_rate for current & next).
+        mc_col = mc_return[:, None]  # (B, 1) broadcasts against (B, n_act)
         with torch.no_grad():
-            floor_binds_1 = (q_pi_1 < mc_return).float().mean()
-            floor_binds_2 = (q_pi_2 < mc_return).float().mean()
-            floor_binds_frac = 0.5 * (floor_binds_1 + floor_binds_2)
-            q_pi_pre_floor_mean = 0.5 * (q_pi_1.mean() + q_pi_2.mean())
+            binds = torch.cat(
+                [(q_cur_1 < mc_col).float(), (q_cur_2 < mc_col).float(),
+                 (q_nxt_1 < mc_col).float(), (q_nxt_2 < mc_col).float()],
+                dim=-1,
+            )
+            floor_binds_frac = binds.mean()
+            q_pi_pre_floor_mean = 0.25 * (
+                q_cur_1.mean() + q_cur_2.mean() + q_nxt_1.mean() + q_nxt_2.mean()
+            )
 
-        # Calibration: floor q_pi by MC return (only meaningful on offline samples;
-        # online samples have mc_return = 0 which is a non-active floor under sparse rewards)
+        # ---- Cal-QL calibration: floor BOTH policy groups by the MC return ----
+        # (ref lines ~236-240: bound current & next actions). Done BEFORE the
+        # importance-sampling log-prob correction. Online samples have mc_return=0,
+        # a non-active floor under sparse rewards; offline samples carry the floor.
         if self.use_calibration:
-            q_pi_1 = torch.max(q_pi_1, mc_return)[:, None]
-            q_pi_2 = torch.max(q_pi_2, mc_return)[:, None]
-        else:
-            q_pi_1 = q_pi_1[:, None]
-            q_pi_2 = q_pi_2[:, None]
+            q_cur_1 = torch.max(q_cur_1, mc_col)
+            q_cur_2 = torch.max(q_cur_2, mc_col)
+            q_nxt_1 = torch.max(q_nxt_1, mc_col)
+            q_nxt_2 = torch.max(q_nxt_2, mc_col)
 
-        cat_q_1 = torch.cat([q_rand_1, q_pi_1], dim=-1)
-        cat_q_2 = torch.cat([q_rand_2, q_pi_2], dim=-1)
+        # ---- Importance-sampling correction (ref cql_importance_sample=True) ----
+        # Subtract each group's log density so the logsumexp estimates the
+        # soft-max over actions w.r.t. the uniform measure. (When importance
+        # sampling, the ref does NOT include the q_data term inside the logsumexp.)
+        cat_q_1 = torch.cat(
+            [q_rand_1, q_cur_1 - log_pi_cur, q_nxt_1 - log_pi_nxt], dim=-1
+        )
+        cat_q_2 = torch.cat(
+            [q_rand_2, q_cur_2 - log_pi_cur, q_nxt_2 - log_pi_nxt], dim=-1
+        )
         cql_qf1_ood = torch.logsumexp(cat_q_1, dim=-1)
         cql_qf2_ood = torch.logsumexp(cat_q_2, dim=-1)
 
+        # Subtract the log-likelihood of the data action (ref: cql_qf_diff = ood - q_pred).
         cql_qf1_diff = torch.clamp(
             cql_qf1_ood - q_data1, min=self.cql_clip_diff_min, max=self.cql_clip_diff_max
         ).mean()
@@ -396,23 +442,45 @@ class PLDCalQLSAC(ResidualRLAlgorithm):
 
     # ============================================================ contract: online update
 
+    @staticmethod
+    def _slice_batch(batch: dict, i: int, mb: int) -> dict:
+        """Slice a dict-of-tensors batch into minibatch ``i`` of size ``mb`` along
+        dim 0. Works uniformly for vectors (B, D) and image tensors (B, n_cam, H,
+        W, 3) since slicing only touches the leading (batch) axis.
+        """
+        s = slice(i * mb, (i + 1) * mb)
+        return {k: v[s] for k, v in batch.items()}
+
     def update(self, batch, utd: int) -> dict:
-        """One online update cycle.
+        """One online update cycle (RLPD-faithful UTD; ref rlpd sac_learner.update).
 
-        UTD critic updates (each on a fresh-style use of ``batch``, mirroring the
-        original loop which reused the sampled batch across UTD critic steps),
-        then one actor update, one temperature update, with polyak after each
-        critic update.
+        The incoming ``batch`` has size ``batch_size * utd``. It is sliced into
+        ``utd`` DISTINCT, equal-size minibatches along dim 0 — one fresh minibatch
+        per critic update (so ``utd`` distinct critic updates), with polyak after
+        each. A single actor update and a single temperature update are then run
+        on the LAST minibatch (matching RLPD doing actor/temp once per cycle).
 
-        NOTE: faithfully mirrors ``train_pld_stage1.train_loop`` — the same
-        ``batch`` is reused for all UTD critic steps and the actor/temp steps.
+        The per-minibatch loss math, grad clipping, and polyak are unchanged.
+        Reported info comes from the last minibatch.
         """
         self.train()
-        alpha = self._alpha()
 
-        # ---- UTD critic updates (encoder + critic) ----
-        for _ in range(utd):
-            critic_loss, info_c = self.loss_critic(batch, alpha=self._alpha())
+        # Determine minibatch size; require exact divisibility (mirrors RLPD's
+        # ``assert x.shape[0] % utd_ratio == 0``).
+        total = batch["reward"].shape[0]
+        assert total % utd == 0, (
+            f"update() batch size {total} not divisible by utd={utd}; "
+            f"the trainer must sample batch_size * utd."
+        )
+        mb = total // utd
+
+        # ---- UTD critic updates (encoder + critic), one DISTINCT minibatch each ----
+        critic_loss = None
+        info_c = None
+        last_mb = None
+        for i in range(utd):
+            last_mb = self._slice_batch(batch, i, mb)
+            critic_loss, info_c = self.loss_critic(last_mb, alpha=self._alpha())
             self.encoder_critic_optim.zero_grad()
             critic_loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -422,15 +490,15 @@ class PLDCalQLSAC(ResidualRLAlgorithm):
             self.encoder_critic_optim.step()
             self.polyak_update()
 
-        # ---- Actor update ----
-        actor_loss, info_a = self.loss_actor(batch, alpha=self._alpha())
+        # ---- Actor update (last minibatch) ----
+        actor_loss, info_a = self.loss_actor(last_mb, alpha=self._alpha())
         self.actor_optim.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         self.actor_optim.step()
 
-        # ---- Temperature update ----
-        tloss, info_t = self.loss_temperature(batch, self.log_alpha, self.target_entropy)
+        # ---- Temperature update (last minibatch) ----
+        tloss, info_t = self.loss_temperature(last_mb, self.log_alpha, self.target_entropy)
         self.alpha_optim.zero_grad()
         tloss.backward()
         self.alpha_optim.step()

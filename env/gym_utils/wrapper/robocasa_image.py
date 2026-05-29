@@ -58,6 +58,7 @@ class RobocasaImageWrapper(gym.Env):
         success_steps_before_termination=5,
         keep_cams_separate=False,
         task_description=None,
+        max_episode_steps=None,
     ):
         self.env = env  # gymnasium env
         self.clamp_obs = clamp_obs
@@ -65,6 +66,7 @@ class RobocasaImageWrapper(gym.Env):
         self.render_camera_name = render_camera_name
         self.video_writer = None
         self.success_steps_before_termination = success_steps_before_termination
+        self.max_episode_steps = max_episode_steps
         self.keep_cams_separate = keep_cams_separate
         self.task_description = task_description
         self._last_raw_obs = None
@@ -288,6 +290,18 @@ class RobocasaImageWrapper(gym.Env):
         else:
             if not self.ever_succeeded:
                 self.success_count = 0
+
+        # Enforce time-limit truncation. The underlying robocasa env does not
+        # reliably emit `truncated`, so without this a failing episode never ends
+        # and is never counted — making eval SR look like 100% (only successes
+        # terminate). A timed-out, never-succeeded episode counts as a failure
+        # downstream (done fires; episode_success stays False).
+        if (
+            self.max_episode_steps is not None
+            and not terminated
+            and self.step_count >= self.max_episode_steps
+        ):
+            truncated = True
 
         if truncated:
             info["TimeLimit.truncated"] = True

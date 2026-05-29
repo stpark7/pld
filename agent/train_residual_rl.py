@@ -285,6 +285,8 @@ class TrainResidualRL(TrainAgent):
         cur_proprio = np.asarray(last_obs["state"], dtype=np.float32)
 
         next_obs, reward, terminated, truncated, info = self.venv.step(a_total_raw)
+        # ``done`` (terminated OR truncated) drives LOOP logic ONLY: chunk advance,
+        # episode reset, episode counting.
         done = np.logical_or(np.asarray(terminated), np.asarray(truncated))
         next_gr00t_raw = PLDDataCollector.extract_gr00t_raw_from_info(info, n_envs)
 
@@ -307,6 +309,11 @@ class TrainResidualRL(TrainAgent):
             next_rgb=next_rgb,
             next_proprio=next_proprio,
             next_a_base=next_a_base_norm,
+            # The wrapper auto-resets on done and does NOT expose the pre-reset
+            # final observation, so we cannot bootstrap correctly through a
+            # truncation (next_obs would be the reset state, next_a_base=0). For
+            # this sparse-reward task a timeout = failure ≈ value 0, so treating
+            # truncation as terminal (target ≈ reward) is correct. Store the OR.
             done=done_arr,
         )
 
@@ -362,7 +369,9 @@ class TrainResidualRL(TrainAgent):
             prev_done = done
 
             # 2. Gradient updates via the algorithm contract (UTD + actor + temp + polyak).
-            batch = self.buffer.sample(self.batch_size, expert_ratio=0.5)
+            # RLPD-faithful: sample batch_size * utd, the algorithm slices it into
+            # `utd` DISTINCT minibatches (one fresh minibatch per critic update).
+            batch = self.buffer.sample(self.batch_size * self.utd, expert_ratio=0.5)
             info = self.algorithm.update(batch, self.utd)
 
             if (step + 1) % 200 == 0:
@@ -414,8 +423,12 @@ class TrainResidualRL(TrainAgent):
 
     # ============================================================ evaluation (shared pool)
 
-    def evaluate(self, n_episodes: int, deterministic: bool = True) -> float:
+    def evaluate(self, n_episodes: int, deterministic: bool = True,
+                 zero_residual: bool = False) -> float:
         """Evaluate on the SAME shared 4-env pool used for training.
+
+        If ``zero_residual`` is True, the residual is forced to 0 so this measures
+        the frozen base GR00T policy alone (harness sanity / base reference).
 
         Snapshots the collector chunk state, resets the pool, runs eval, then
         the caller resumes training via a fresh bootstrap. Restoring the chunk
@@ -460,11 +473,14 @@ class TrainResidualRL(TrainAgent):
                 proprio_t = torch.as_tensor(
                     last_obs["state"], dtype=torch.float32, device=self.device
                 )
-                a_base_t = torch.as_tensor(a_base_norm, device=self.device)
-                a_delta_t = self.algorithm.select_action(
-                    rgb_t, proprio_t, a_base_t, deterministic=deterministic
-                )
-                a_delta_norm = a_delta_t.detach().cpu().numpy().astype(np.float32)
+                if zero_residual:
+                    a_delta_norm = np.zeros((n_envs, 7), dtype=np.float32)
+                else:
+                    a_base_t = torch.as_tensor(a_base_norm, device=self.device)
+                    a_delta_t = self.algorithm.select_action(
+                        rgb_t, proprio_t, a_base_t, deterministic=deterministic
+                    )
+                    a_delta_norm = a_delta_t.detach().cpu().numpy().astype(np.float32)
                 a_total_norm = a_base_norm + a_delta_norm
                 a_total_raw = collector.to_env_action(a_total_norm)
 

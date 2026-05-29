@@ -100,6 +100,12 @@ def parse_args():
         default=True,
         help="Use the deterministic residual mode (default true).",
     )
+    p.add_argument(
+        "--zero_residual",
+        action="store_true",
+        default=False,
+        help="Force residual=0 to evaluate the frozen base GR00T policy alone.",
+    )
     return p.parse_args()
 
 
@@ -138,7 +144,10 @@ def main():
         f"Evaluating residual policy for {args.n_episodes} episodes on "
         f"{cfg.env.name} with {args.n_envs} envs (deterministic={args.deterministic})"
     )
-    sr = trainer.evaluate(args.n_episodes, deterministic=args.deterministic)
+    sr = trainer.evaluate(
+        args.n_episodes, deterministic=args.deterministic,
+        zero_residual=args.zero_residual,
+    )
     log.info("=" * 60)
     log.info(f"FINAL success rate ({args.n_episodes} episodes): {sr:.4f} ({sr*100:.1f}%)")
     log.info("=" * 60)
