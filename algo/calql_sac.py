@@ -421,10 +421,42 @@ class PLDCalQLSAC(ResidualRLAlgorithm):
 
     # ============================================================ contract: critic pretrain
 
-    def pretrain_critic_step(self, offline_batch) -> dict:
-        """One Cal-QL critic-init step on an offline batch (encoder updates too).
+    def pretrain_critic_step(self, offline_batch) -> dict[str, torch.Tensor]:
+        """
+        Phase 2: run ONE Cal-QL critic-init gradient step on offline data only.
 
-        Mirrors the per-step body of the old ``train_pld_stage1.pretrain_critic``.
+        Computes the Cal-QL critic loss (SAC TD error + conservative CQL term,
+        floored by the offline MC return), backprops into the SHARED encoder +
+        critic, clips grads, steps ``encoder_critic_optim``, then polyak-updates
+        the target critic. The actor and temperature are left untouched — this
+        only warms up Q so online RL does not start from a random critic.
+
+        Args:
+            offline_batch: an offline-only minibatch (see
+                ``PLDReplayBuffer.sample_offline_only``); its ``mc_return`` field
+                supplies the Cal-QL calibration floor.
+
+        Returns:
+            A log-info dict of detached scalar tensors (no grads):
+
+                key                    | meaning
+                ---------------------- | ----------------------------------------
+                critic_loss            | total critic loss (td_loss + cql_loss)
+                td_loss                | double-Q Bellman TD error
+                cql_loss               | conservative CQL penalty (scaled)
+                q_data1_mean           | mean Q1 on dataset actions
+                q_data2_mean           | mean Q2 on dataset actions
+                target_q_mean          | mean Bellman target
+                cql_qf1_diff           | CQL gap (logsumexp - data) for Q1
+                cql_qf2_diff           | CQL gap (logsumexp - data) for Q2
+                mc_return_mean         | mean offline MC return in the batch
+                mc_return_max          | max offline MC return in the batch
+                mc_return_nonzero_frac | fraction of transitions with MC return != 0
+                q_pi_pre_floor_mean    | mean policy-action Q before the MC floor
+                calib_floor_binds_frac | fraction of policy-sample Qs the floor lifts
+
+            Side effect: the encoder, critic, and target-critic weights are
+            updated in place.
         """
         self.train()
         critic_loss, info = self.loss_critic(offline_batch, alpha=self._alpha())

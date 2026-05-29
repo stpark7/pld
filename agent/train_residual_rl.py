@@ -115,9 +115,37 @@ class TrainResidualRL(TrainAgent):
 
     # ============================================================ phase 1: offline
 
-    def collect_offline_trajectories(self, n_success_target: int):
-        """Roll out the base policy (a_delta=0) until we have n_success_target
-        successful trajectories.
+    def collect_offline_trajectories(
+        self, n_success_target: int
+    ) -> list[dict[str, np.ndarray]]:
+        """
+        Phase 1: roll out the FROZEN base policy (residual = 0) on the shared
+        env pool and collect successful demonstration trajectories.
+
+        Steps every env in lockstep, keeping an episode only if it earned a
+        positive reward and ran for >= 2 steps; failed or 1-step episodes are
+        dropped. Stops once enough successes are banked.
+
+        Args:
+            n_success_target: how many successful trajectories to gather.
+
+        Returns:
+            A list of trajectories, one dict per successful episode. Its length
+            is >= n_success_target (it can overshoot, since multiple envs may
+            finish on the same step). Each dict holds these arrays, stacked over
+            that episode's T steps:
+
+                key      | shape               | dtype   | meaning
+                -------- | ------------------- | ------- | -------------------------
+                rgb      | (T, N_cam, H, W, 3) | uint8   | camera frames at step t
+                proprio  | (T, proprio_dim)    | float32 | robot state at step t
+                a_base   | (T, 7)              | float32 | normalized base action run
+                reward   | (T,)                | float32 | env reward at step t
+                done     | (T,)                | bool    | terminal flag, True only at t = T-1
+
+            T varies per episode. MC returns and the next_* (s') fields are NOT
+            included here; PLDReplayBuffer.load_offline_trajectories derives them
+            when these trajectories are ingested.
         """
         log.info(
             f"Collecting offline trajectories — target {n_success_target} successes, "
@@ -148,7 +176,7 @@ class TrainResidualRL(TrainAgent):
         last_gr00t_raw = gr00t_raw_list
 
         while len(successes) < n_success_target:
-            a_base_norm = self.collector.get_a_base_norm(last_gr00t_raw)  # (n_envs, 7)
+            a_base_norm = self.collector.get_a_base_norm(last_gr00t_raw, last_obs["rgb"])  # (n_envs, 7)
 
             a_total_norm = a_base_norm.copy()
             a_total_raw = self.collector.to_env_action(a_total_norm)
@@ -209,8 +237,26 @@ class TrainResidualRL(TrainAgent):
 
     # ============================================================ phase 2: critic pretrain
 
-    def pretrain_critic(self, n_steps: int):
-        """Critic-init via the algorithm contract (offline data only)."""
+    def pretrain_critic(self, n_steps: int) -> None:
+        """
+        Phase 2: initialize the Cal-QL critic on OFFLINE data only, before any
+        online interaction (gated by ``algorithm.needs_pretrain``).
+
+        Each step samples an offline-only minibatch (the successful base-policy
+        demos from phase 1, carrying their MC returns) and runs one
+        ``algorithm.pretrain_critic_step``, which does a Cal-QL critic + encoder
+        update and a polyak target sync. The actor is NOT touched here — this only
+        warms up Q so online RL doesn't start from a random critic. Progress (loss
+        + MC/calibration diagnostics) is logged, and optionally sent to wandb,
+        every 500 steps.
+
+        Args:
+            n_steps: number of offline critic-init gradient steps to run.
+
+        Returns:
+            None. Side effect only: the algorithm's encoder/critic/target-critic
+            weights are updated in place.
+        """
         log.info(f"Critic pretraining for {n_steps} steps (offline only)")
         for step in range(n_steps):
             batch = self.buffer.sample_offline_only(self.batch_size)
@@ -260,7 +306,7 @@ class TrainResidualRL(TrainAgent):
         """
         n_envs = self.n_envs
 
-        a_base_norm = self.collector.get_a_base_norm(last_gr00t_raw)  # (n_envs, 7)
+        a_base_norm = self.collector.get_a_base_norm(last_gr00t_raw, last_obs["rgb"])  # (n_envs, 7)
 
         # ---- chunk-consistency assertion ----
         if prev_next_a_base is not None and prev_done is not None:
@@ -292,7 +338,7 @@ class TrainResidualRL(TrainAgent):
 
         # Advance chunk pointers, then read next_a_base (0 for done envs).
         self.collector.advance(done)
-        next_a_base_norm = self.collector.get_next_a_base_norm(next_gr00t_raw, done)
+        next_a_base_norm = self.collector.get_next_a_base_norm(next_gr00t_raw, next_obs["rgb"], done)
 
         next_rgb = np.asarray(next_obs["rgb"])
         next_proprio = np.asarray(next_obs["state"], dtype=np.float32)
@@ -333,7 +379,26 @@ class TrainResidualRL(TrainAgent):
 
     # ============================================================ phase 3: warm-up
 
-    def warmup_collect(self, n_episodes: int):
+    def warmup_collect(self, n_episodes: int) -> None:
+        """
+        Phase 3: roll out the FROZEN base policy (residual = 0) to seed the
+        ONLINE buffer before online RL begins.
+
+        Bootstraps a fresh first observation on the shared env pool, then steps
+        every env in lockstep via ``_collect_and_add(use_residual=False)`` — each
+        step appends one online transition per env to the buffer — until
+        ``n_episodes`` episodes have finished. The chunk-consistency assertion
+        runs throughout (``prev_next_a_base`` / ``prev_done`` are threaded between
+        steps), so a desynced collector pointer fails fast here.
+
+        Args:
+            n_episodes: how many episodes to collect. The total can overshoot,
+                since multiple envs may finish on the same step.
+
+        Returns:
+            None. Side effect only: online transitions are appended to
+            ``self.buffer`` (the ring buffer); no trajectories are returned.
+        """
         log.info(f"Warm-up: collecting {n_episodes} episodes (a_delta=0)")
         last_obs, last_gr00t_raw = self._bootstrap_first_obs()
         completed = 0
@@ -468,7 +533,7 @@ class TrainResidualRL(TrainAgent):
                     )
                     break
                 iter_count += 1
-                a_base_norm = collector.get_a_base_norm(last_gr00t_raw)
+                a_base_norm = collector.get_a_base_norm(last_gr00t_raw, last_obs["rgb"])
                 rgb_t = torch.as_tensor(last_obs["rgb"], device=self.device)
                 proprio_t = torch.as_tensor(
                     last_obs["state"], dtype=torch.float32, device=self.device

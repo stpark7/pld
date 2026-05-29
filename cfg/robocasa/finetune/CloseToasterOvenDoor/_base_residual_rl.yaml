@@ -47,7 +47,7 @@ env:
       normalization_path: null
       shape_meta: ${shape_meta}
       keep_cams_separate: true
-      success_steps_before_termination: 5
+      success_steps_before_termination: 5 # ! 이거 수정 고려
       task_description: ${task_description}
       max_episode_steps: ${env.max_episode_steps}
 

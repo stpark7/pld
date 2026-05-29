@@ -2,10 +2,13 @@
 Environment wrapper for RoboCasa environments with image observations.
 
 Built on gymnasium (both the underlying RoboCasa env and the vector envs in env/gym_utils/).
-Extracts 9D arm-only state and concatenates 3 camera images for the residual policy,
-and at the same time exposes a GR00T N1.5 Panda-Omron-ready observation dict (time axis
-added, language included) via ``info["gr00t_raw"]`` for the frozen base policy.
-Converts 7D normalized actions to 12D Dict actions for RoboCasa.
+Extracts 9D arm-only state and stacks 3 camera images (N_cam, H, W, 3) for the residual
+policy. It also exposes, via ``info["gr00t_raw"]``, the NON-image part of a GR00T N1.5
+Panda-Omron observation (5 state keys + language + camera-key order) for the frozen base
+policy. The camera frames are deliberately NOT duplicated into ``gr00t_raw`` — they are the
+same pixels as ``obs["rgb"]``, so the collector rebuilds GR00T's per-camera video inputs
+from ``obs["rgb"]`` instead of shipping every image twice. Converts 7D normalized actions to
+12D Dict actions for RoboCasa.
 """
 
 import numpy as np
@@ -165,15 +168,22 @@ class RobocasaImageWrapper(gym.Env):
         return {"state": state, "rgb": rgb}
 
     def _build_gr00t_obs(self, raw_obs):
-        """Build a GR00T N1.5 Panda-Omron-ready observation dict from RoboCasa raw obs.
+        """Build the NON-image part of a GR00T N1.5 Panda-Omron observation.
 
-        - Selects only the modality keys GR00T uses (3 cameras + 5 state keys).
-        - Adds an explicit time axis ``T=1`` to every video/state field.
-        - Adds ``annotation.human.task_description`` from raw obs if present,
-          otherwise from ``self.task_description``.
+        The camera frames are intentionally NOT included here: ``obs["rgb"]``
+        already carries the exact same pixels (same cameras, same order), so
+        duplicating them into ``info["gr00t_raw"]`` would ship every image twice
+        across the vector-env boundary. Instead the collector reconstructs the
+        per-camera GR00T video inputs from ``obs["rgb"]`` using the camera-key
+        order advertised in ``_video_keys``. Only the fields that cannot be
+        recovered from ``obs["rgb"]`` live here:
+          - the 5 GR00T state keys (incl. the mobile-base pose obs["state"] drops),
+          - the ``annotation.human.task_description`` language string,
+          - ``_video_keys``: metadata telling the collector how to split rgb.
 
-        Returns None if a language source is unavailable (neither raw obs nor
-        ``self.task_description`` provides one). Non-GR00T callers ignore this.
+        Adds an explicit time axis ``T=1`` to every state field. Returns None if a
+        language source is unavailable (neither raw obs nor ``self.task_description``
+        provides one); non-GR00T callers ignore this.
         """
         if GR00T_LANGUAGE_KEY in raw_obs:
             language = raw_obs[GR00T_LANGUAGE_KEY]
@@ -182,16 +192,20 @@ class RobocasaImageWrapper(gym.Env):
         else:
             return None
 
+        # Reconstruction from obs["rgb"] is only valid when cameras are kept
+        # separate ((N_cam, H, W, 3)) and their order matches GR00T's video keys.
+        assert self.keep_cams_separate, (
+            "GR00T obs reconstruction requires keep_cams_separate=True so that "
+            "obs['rgb'] is (N_cam, H, W, 3) and can be split back into per-camera "
+            "GR00T video inputs by the collector."
+        )
+        assert list(self.camera_keys) == list(GR00T_VIDEO_KEYS), (
+            f"camera_keys {self.camera_keys} must match GR00T_VIDEO_KEYS "
+            f"{GR00T_VIDEO_KEYS} in name and order: the collector rebuilds the "
+            "GR00T video dict from obs['rgb'] using this ordering."
+        )
+
         out = {}
-        for key in GR00T_VIDEO_KEYS:
-            if key not in raw_obs:
-                raise KeyError(f"Raw obs missing GR00T video key: {key}")
-            arr = np.asarray(raw_obs[key])
-            if arr.ndim == 3:  # (H, W, C) -> (T=1, H, W, C)
-                arr = arr[None]
-            elif arr.ndim != 4:
-                raise ValueError(f"Unexpected shape for {key}: {arr.shape}")
-            out[key] = arr
         for key in GR00T_STATE_KEYS:
             if key not in raw_obs:
                 raise KeyError(f"Raw obs missing GR00T state key: {key}")
@@ -205,6 +219,9 @@ class RobocasaImageWrapper(gym.Env):
         if lang_arr.ndim == 0:
             lang_arr = lang_arr.reshape(1)
         out[GR00T_LANGUAGE_KEY] = lang_arr
+        # Camera-key order used by the collector to split obs["rgb"] back into the
+        # per-camera GR00T video inputs (same pixels, no second copy shipped).
+        out["_video_keys"] = list(self.camera_keys)
         return out
 
     def _combined_camera_frame(self, raw_obs):
